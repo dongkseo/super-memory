@@ -186,6 +186,8 @@ class MemoryGraph:
         self._mem_to_keys: dict[str, set[str]] = {}
         # supersede 역방향 인덱스: old_id → new_id
         self._superseded_by: dict[str, str] = {}
+        # 기존 데이터의 임베딩 차원 (백엔드 전환 감지용)
+        self._stored_dim: int | None = None
 
     # ── 링크 인덱스 헬퍼 ──
 
@@ -207,6 +209,19 @@ class MemoryGraph:
     def link_count(self) -> int:
         return sum(len(mids) for mids in self._key_to_mems.values())
 
+    def _check_dim(self, embedding: list[float]) -> None:
+        """기존 데이터와 임베딩 차원이 다르면 에러 발생."""
+        new_dim = len(embedding)
+        if self._stored_dim is None:
+            self._stored_dim = new_dim
+            return
+        if new_dim != self._stored_dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch: existing data uses {self._stored_dim}-dim, "
+                f"current backend ({EMBEDDING_BACKEND}) produces {new_dim}-dim.\n"
+                f"To switch backends, delete ~/.super-memory/graph.json first."
+            )
+
     def load(self) -> None:
         raw = _read_json(GRAPH_FILE)
         if not raw:
@@ -217,6 +232,9 @@ class MemoryGraph:
             if "embedding" not in m:
                 m["embedding"] = embed_text(m["content"])
             self.memories[mid] = Memory(**m)
+        if self.memories:
+            first_mem = next(iter(self.memories.values()))
+            self._stored_dim = len(first_mem.embedding)
         for lnk in raw.get("links", []):
             self._link(lnk["key_id"], lnk["memory_id"])
         # supersede 역방향 인덱스 빌드
@@ -302,13 +320,15 @@ class MemoryGraph:
             key_types: dict[str, str] | None = None,
             source: dict | None = None) -> str:
         """key_types: {"동건": "name", "파이썬": "concept"} 형태로 타입 지정."""
+        embedding = await embed_text_async(content)  # lock 밖에서 API 호출
         async with self._lock:
+            self._check_dim(embedding)
             key_types = key_types or {}
             mid = _uid()
             self.memories[mid] = Memory(
                 id=mid,
                 content=content,
-                embedding=await embed_text_async(content),
+                embedding=embedding,
                 created_at=time.time(),
                 source=source,
                 last_accessed=time.time(),
@@ -382,6 +402,7 @@ class MemoryGraph:
             return []
 
         q_emb = await embed_text_async(query)  # lock 밖에서 API 호출
+        self._check_dim(q_emb)
 
         async with self._lock:
             query_lower = query.lower().strip()

@@ -152,5 +152,5 @@ def memory_stats() -> str:
     return json.dumps({
         "keys": len(graph.keys),
         "memories": len(graph.memories),
-        "links": len(graph.links),
+        "links": graph.link_count,
     })

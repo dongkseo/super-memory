@@ -83,7 +83,7 @@ Stats: {stats}
 
 
 def _stats() -> str:
-    return f"{len(graph.keys)} keys, {len(graph.memories)} memories, {len(graph.links)} links"
+    return f"{len(graph.keys)} keys, {len(graph.memories)} memories, {graph.link_count} links"
 
 
 @mcp.prompt()

@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import json
 import math
 import os
@@ -13,27 +14,38 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# DATA_DIR: 환경변수 우선, 기본값은 ~/.super-memory/
+DATA_DIR = Path(os.getenv("SUPER_MEMORY_DATA_DIR", Path.home() / ".super-memory"))
 GRAPH_FILE = DATA_DIR / "graph.json"
 CONVERSATIONS_DIR = DATA_DIR / "conversations"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-KEY_MERGE_THRESHOLD = 0.85  # OpenAI 임베딩은 유사도 분포가 더 정확
+KEY_MERGE_THRESHOLD = 0.85
 DEPTH_INCREMENT = 0.05
 DEPTH_MAX = 1.0
-DEPTH_DEEP_THRESHOLD = 0.7  # 이 이상이면 deep memory (correction 저항)
+DEPTH_DEEP_THRESHOLD = 0.7
+
+_EMBED_RETRIES = 3
+
 
 def embed_text(text: str) -> list[float]:
     """OpenAI Embedding API 호출 (동기, load 전용)."""
-    resp = httpx.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["data"][0]["embedding"]
+    for attempt in range(_EMBED_RETRIES):
+        try:
+            resp = httpx.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()["data"][0]["embedding"]
+        except (httpx.HTTPStatusError, httpx.TransportError):
+            if attempt == _EMBED_RETRIES - 1:
+                raise
+            time.sleep(2 ** attempt)
+    raise RuntimeError("unreachable")
 
 
 _async_client: httpx.AsyncClient | None = None
@@ -46,16 +58,47 @@ def _get_async_client() -> httpx.AsyncClient:
     return _async_client
 
 
+def _shutdown_async_client() -> None:
+    """프로세스 종료 시 AsyncClient 정리."""
+    global _async_client
+    if _async_client and not _async_client.is_closed:
+        try:
+            loop = asyncio.get_event_loop()
+            if not loop.is_running():
+                loop.run_until_complete(_async_client.aclose())
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_async_client)
+
+
 async def embed_text_async(text: str) -> list[float]:
-    """OpenAI Embedding API 호출 (비동기)."""
+    """OpenAI Embedding API 호출 (비동기, retry 포함)."""
     client = _get_async_client()
-    resp = await client.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
-    )
-    resp.raise_for_status()
-    return resp.json()["data"][0]["embedding"]
+    for attempt in range(_EMBED_RETRIES):
+        try:
+            resp = await client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
+            )
+            resp.raise_for_status()
+            return resp.json()["data"][0]["embedding"]
+        except (httpx.HTTPStatusError, httpx.TransportError):
+            if attempt == _EMBED_RETRIES - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+    raise RuntimeError("unreachable")
+
+
+def _batch_cosine_sim(query_emb: list[float], matrix: np.ndarray) -> np.ndarray:
+    """query_emb vs rows of matrix → shape (n,) cosine similarities."""
+    if matrix.shape[0] == 0:
+        return np.array([])
+    q = np.array(query_emb)
+    norms = np.linalg.norm(matrix, axis=1) * np.linalg.norm(q)
+    return np.where(norms == 0, 0.0, matrix @ q / norms)
 
 
 def cosine_sim(a: list[float], b: list[float]) -> float:
@@ -91,12 +134,6 @@ class Memory:
     last_accessed: float = 0.0
 
 
-@dataclass
-class Link:
-    key_id: str
-    memory_id: str
-
-
 # ── Graph ──
 
 
@@ -104,9 +141,35 @@ class Link:
 class MemoryGraph:
     keys: dict[str, Key] = field(default_factory=dict)
     memories: dict[str, Memory] = field(default_factory=dict)
-    links: list[Link] = field(default_factory=list)
     _dirty: bool = field(default=False, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        # 양방향 링크 인덱스: O(1) 조회
+        self._key_to_mems: dict[str, set[str]] = {}
+        self._mem_to_keys: dict[str, set[str]] = {}
+        # supersede 역방향 인덱스: old_id → new_id
+        self._superseded_by: dict[str, str] = {}
+
+    # ── 링크 인덱스 헬퍼 ──
+
+    def _link(self, key_id: str, memory_id: str) -> None:
+        self._key_to_mems.setdefault(key_id, set()).add(memory_id)
+        self._mem_to_keys.setdefault(memory_id, set()).add(key_id)
+
+    def _has_link(self, key_id: str, memory_id: str) -> bool:
+        return memory_id in self._key_to_mems.get(key_id, set())
+
+    def _unlink_memory(self, memory_id: str) -> None:
+        for kid in self._mem_to_keys.pop(memory_id, set()):
+            mems = self._key_to_mems.get(kid, set())
+            mems.discard(memory_id)
+            if not mems:
+                self._key_to_mems.pop(kid, None)
+
+    @property
+    def link_count(self) -> int:
+        return sum(len(mids) for mids in self._key_to_mems.values())
 
     def load(self) -> None:
         raw = _read_json(GRAPH_FILE)
@@ -119,23 +182,31 @@ class MemoryGraph:
                 m["embedding"] = embed_text(m["content"])
             self.memories[mid] = Memory(**m)
         for lnk in raw.get("links", []):
-            self.links.append(Link(**lnk))
-        print(f"[graph] loaded {len(self.keys)} keys, {len(self.memories)} memories, {len(self.links)} links")
+            self._link(lnk["key_id"], lnk["memory_id"])
+        # supersede 역방향 인덱스 빌드
+        for mid, mem in self.memories.items():
+            if mem.supersedes:
+                self._superseded_by[mem.supersedes] = mid
+        print(f"[graph] loaded {len(self.keys)} keys, {len(self.memories)} memories, {self.link_count} links")
 
     async def save(self) -> None:
         """비동기로 디스크에 저장하고 dirty 플래그 해제."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        links_list = [
+            {"key_id": kid, "memory_id": mid}
+            for kid, mids in self._key_to_mems.items()
+            for mid in mids
+        ]
         data = {
             "keys": {kid: _key_dict(k) for kid, k in self.keys.items()},
             "memories": {mid: _mem_dict(m) for mid, m in self.memories.items()},
-            "links": [{"key_id": l.key_id, "memory_id": l.memory_id} for l in self.links],
+            "links": links_list,
         }
         content = json.dumps(data, ensure_ascii=False, indent=2)
         await asyncio.to_thread(GRAPH_FILE.write_text, content)
         self._dirty = False
 
     def mark_dirty(self) -> None:
-        """변경이 있음을 표시. flush()로 나중에 저장."""
         self._dirty = True
 
     async def flush(self) -> None:
@@ -156,18 +227,17 @@ class MemoryGraph:
             self.keys[kid] = Key(id=kid, concept=concept, embedding=await embed_text_async(concept), key_type=key_type)
             return kid
 
-        # concept 키는 임베딩 유사도로 병합
+        # concept 키는 배치 임베딩 유사도로 병합
         emb = await embed_text_async(concept)
-        best_sim, best_kid = 0.0, None
-        for kid, key in self.keys.items():
-            if key.key_type != "concept":
-                continue
-            sim = cosine_sim(emb, key.embedding)
-            if sim > best_sim:
-                best_sim = sim
-                best_kid = kid
-        if best_sim >= KEY_MERGE_THRESHOLD and best_kid:
-            return best_kid
+        concept_keys = [(kid, key) for kid, key in self.keys.items() if key.key_type == "concept"]
+        if concept_keys:
+            ids = [kid for kid, _ in concept_keys]
+            matrix = np.array([key.embedding for _, key in concept_keys])
+            sims = _batch_cosine_sim(emb, matrix)
+            best_idx = int(np.argmax(sims))
+            if float(sims[best_idx]) >= KEY_MERGE_THRESHOLD:
+                return ids[best_idx]
+
         kid = _uid()
         self.keys[kid] = Key(id=kid, concept=concept, embedding=emb, key_type="concept")
         return kid
@@ -175,19 +245,17 @@ class MemoryGraph:
     def get_keys_for_memory(self, memory_id: str) -> list[str]:
         """메모리에 연결된 키 concept 목록."""
         return [
-            self.keys[l.key_id].concept
-            for l in self.links
-            if l.memory_id == memory_id and l.key_id in self.keys
+            self.keys[kid].concept
+            for kid in self._mem_to_keys.get(memory_id, set())
+            if kid in self.keys
         ]
 
     def _key_idf(self, key_id: str) -> float:
         """IDF: 많은 기억에 연결된 키일수록 가중치 낮춤."""
-        freq = sum(1 for l in self.links if l.key_id == key_id)
+        freq = len(self._key_to_mems.get(key_id, set()))
         if freq <= 1:
             return 1.0
-        # 2개 연결이면 0.5, 3개면 0.33, ... (1/freq)
         idf = 1.0 / freq
-        # name/proper_noun이 허브가 되면 추가 감쇠
         if key_id in self.keys and self.keys[key_id].key_type in ("name", "proper_noun"):
             idf *= 0.5
         return idf
@@ -213,8 +281,8 @@ class MemoryGraph:
             for concept in key_concepts:
                 kt = key_types.get(concept, "concept")
                 kid = await self.find_or_create_key(concept, key_type=kt)
-                if not any(l.key_id == kid and l.memory_id == mid for l in self.links):
-                    self.links.append(Link(key_id=kid, memory_id=mid))
+                if not self._has_link(kid, mid):
+                    self._link(kid, mid)
             await self.save()
             return mid
 
@@ -231,10 +299,7 @@ class MemoryGraph:
                 raise ValueError(f"Memory {old_id} not found")
 
             old = self.memories[old_id]
-            if old.depth >= DEPTH_DEEP_THRESHOLD:
-                old.depth *= 0.8
-            else:
-                old.depth *= 0.3
+            old.depth = old.depth * 0.8 if old.depth >= DEPTH_DEEP_THRESHOLD else old.depth * 0.3
 
             key_types = key_types or {}
             mid = _uid()
@@ -247,17 +312,18 @@ class MemoryGraph:
                 supersedes=old_id,
                 last_accessed=time.time(),
             )
+            self._superseded_by[old_id] = mid
 
             if key_concepts:
                 key_concepts = _sanitize_keys(key_concepts)
                 for concept in key_concepts:
                     kt = key_types.get(concept, "concept")
                     kid = await self.find_or_create_key(concept, key_type=kt)
-                    self.links.append(Link(key_id=kid, memory_id=mid))
+                    self._link(kid, mid)
             else:
-                for l in self.links:
-                    if l.memory_id == old_id:
-                        self.links.append(Link(key_id=l.key_id, memory_id=mid))
+                # 기존 링크 복사 (스냅샷으로 순회 — 무한루프 방지)
+                for kid in list(self._mem_to_keys.get(old_id, set())):
+                    self._link(kid, mid)
 
             await self.save()
             return mid
@@ -270,83 +336,86 @@ class MemoryGraph:
     def _time_factor(self, mem: "Memory") -> float:
         """시간 decay. deep 기억은 거의 안 잊혀지고 shallow는 빠르게 사라짐."""
         age = time.time() - mem.created_at
-        decay_rate = 1.0 - mem.depth * 0.7  # deep(1.0)이면 0.3, shallow(0.0)이면 1.0
+        decay_rate = 1.0 - mem.depth * 0.7
         decay = math.exp(-age * decay_rate / self.TIME_HALF_LIFE)
-        return 0.5 + 0.5 * decay  # 0.5 ~ 1.0 범위
+        return 0.5 + 0.5 * decay
 
     async def recall(self, query: str, top_k: int = 5) -> list[dict]:
         """두 경로로 검색: (A) 키 매칭 → 링크 → 기억, (B) content 직접 매칭."""
         if not self.memories:
             return []
 
-        q_emb = await embed_text_async(query)
+        q_emb = await embed_text_async(query)  # lock 밖에서 API 호출
 
         async with self._lock:
             query_lower = query.lower().strip()
-
             mem_scores: dict[str, float] = {}
             mem_matched_keys: dict[str, list[str]] = {}
             mem_hop: dict[str, int] = {}
 
-            # ── 경로 A: 키 매칭 → 링크 → 기억 ──
+            # ── 경로 A: 키 배치 매칭 → 링크 → 기억 ──
+            key_ids = list(self.keys.keys())
+            key_sims: np.ndarray = np.array([])
+            if key_ids:
+                key_matrix = np.array([self.keys[kid].embedding for kid in key_ids])
+                key_sims = _batch_cosine_sim(q_emb, key_matrix)
+
             key_scores: list[tuple[float, str]] = []
-            for kid, key in self.keys.items():
+            for i, kid in enumerate(key_ids):
+                key = self.keys[kid]
                 if key.key_type in ("name", "proper_noun"):
                     if key.concept.lower() in query_lower:
                         key_scores.append((1.0, kid))
-                else:
-                    sim = cosine_sim(q_emb, key.embedding)
-                    if sim >= 0.35:
-                        key_scores.append((sim, kid))
+                elif float(key_sims[i]) >= 0.35:
+                    key_scores.append((float(key_sims[i]), kid))
             key_scores.sort(reverse=True)
 
             for key_sim, kid in key_scores[:10]:
                 idf = self._key_idf(kid)
-                for l in self.links:
-                    if l.key_id != kid or l.memory_id not in self.memories:
+                for mem_id in self._key_to_mems.get(kid, set()):
+                    if mem_id not in self.memories:
                         continue
-                    mid = l.memory_id
-                    mem = self.memories[mid]
+                    mem = self.memories[mem_id]
                     depth_factor = 0.5 + mem.depth * 0.5
                     tf = self._time_factor(mem)
                     score = key_sim * idf * depth_factor * tf
-                    mem_scores[mid] = mem_scores.get(mid, 0) + score
-                    mem_matched_keys.setdefault(mid, []).append(self.keys[kid].concept)
-                    mem_hop[mid] = 1
+                    mem_scores[mem_id] = mem_scores.get(mem_id, 0) + score
+                    mem_matched_keys.setdefault(mem_id, []).append(self.keys[kid].concept)
+                    mem_hop[mem_id] = 1
 
-            # ── 경로 B: content 직접 매칭 ──
-            for mid, mem in self.memories.items():
-                content_sim = cosine_sim(q_emb, mem.embedding)
-                if content_sim >= 0.3:
-                    depth_factor = 0.5 + mem.depth * 0.5
-                    tf = self._time_factor(mem)
-                    content_score = content_sim * depth_factor * tf
-                    mem_scores[mid] = mem_scores.get(mid, 0) + content_score
-                    mem_matched_keys.setdefault(mid, []).append("(content)")
-                    if mid not in mem_hop:
-                        mem_hop[mid] = 1
+            # ── 경로 B: content 배치 직접 매칭 ──
+            mem_ids = list(self.memories.keys())
+            if mem_ids:
+                mem_matrix = np.array([self.memories[mid].embedding for mid in mem_ids])
+                content_sims = _batch_cosine_sim(q_emb, mem_matrix)
+                for i, mid in enumerate(mem_ids):
+                    c_sim = float(content_sims[i])
+                    if c_sim >= 0.3:
+                        mem = self.memories[mid]
+                        depth_factor = 0.5 + mem.depth * 0.5
+                        tf = self._time_factor(mem)
+                        mem_scores[mid] = mem_scores.get(mid, 0) + c_sim * depth_factor * tf
+                        mem_matched_keys.setdefault(mid, []).append("(content)")
+                        if mid not in mem_hop:
+                            mem_hop[mid] = 1
 
-            # 3단계 (2홉): 1홉 기억의 다른 키 → 새로운 기억
-            hop1_mids = set(mem_scores.keys())
-            for mid in list(hop1_mids):
+            # ── 2홉: 1홉 기억의 다른 키 → 새로운 기억 ──
+            for mid in list(mem_scores.keys()):
                 hop1_score = mem_scores[mid]
-                my_kids = {l.key_id for l in self.links if l.memory_id == mid}
-                for kid in my_kids:
+                for kid in self._mem_to_keys.get(mid, set()):
                     if kid not in self.keys:
                         continue
                     concept = self.keys[kid].concept
                     idf = self._key_idf(kid)
-                    for l in self.links:
-                        if l.key_id != kid or l.memory_id == mid or l.memory_id not in self.memories:
+                    for other_mid in self._key_to_mems.get(kid, set()):
+                        if other_mid == mid or other_mid not in self.memories:
                             continue
-                        other_mid = l.memory_id
                         hop2_score = hop1_score * self.HOP_DECAY * idf
                         mem_scores[other_mid] = mem_scores.get(other_mid, 0) + hop2_score
                         mem_matched_keys.setdefault(other_mid, []).append(f"{concept}(via)")
                         if other_mid not in mem_hop:
                             mem_hop[other_mid] = 2
 
-            # 4단계: 정렬, depth 강화, 반환
             ranked = sorted(mem_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
             results = []
@@ -355,13 +424,6 @@ class MemoryGraph:
                 mem.depth = min(mem.depth + DEPTH_INCREMENT, DEPTH_MAX)
                 mem.access_count += 1
                 mem.last_accessed = time.time()
-
-                superseded_by = None
-                for m in self.memories.values():
-                    if m.supersedes == mid:
-                        superseded_by = m.id
-                        break
-
                 results.append({
                     "id": mid,
                     "content": mem.content,
@@ -373,13 +435,14 @@ class MemoryGraph:
                     "access_count": mem.access_count,
                     "source": mem.source,
                     "supersedes": mem.supersedes,
-                    "superseded_by": superseded_by,
+                    "superseded_by": self._superseded_by.get(mid),
                     "created_at": mem.created_at,
                 })
 
             self.mark_dirty()
-            await self.flush()
-            return results
+
+        await self.flush()  # lock 밖에서 I/O
+        return results
 
     # ── 연관 기억 탐색 (공유 키 기반) ──
 
@@ -388,24 +451,17 @@ class MemoryGraph:
         if memory_id not in self.memories:
             return []
 
-        my_kids = {l.key_id for l in self.links if l.memory_id == memory_id}
-
         related: dict[str, dict] = {}
-        for kid in my_kids:
+        for kid in self._mem_to_keys.get(memory_id, set()):
             concept = self.keys[kid].concept if kid in self.keys else "?"
-            for l in self.links:
-                if l.key_id == kid and l.memory_id != memory_id and l.memory_id in self.memories:
-                    mid = l.memory_id
-                    mem = self.memories[mid]
-                    if mid not in related:
-                        related[mid] = {
-                            "id": mid,
-                            "content": mem.content,
-                            "shared_keys": [],
-                            "depth": round(mem.depth, 3),
-                        }
-                    if concept not in related[mid]["shared_keys"]:
-                        related[mid]["shared_keys"].append(concept)
+            for mid in self._key_to_mems.get(kid, set()):
+                if mid == memory_id or mid not in self.memories:
+                    continue
+                mem = self.memories[mid]
+                if mid not in related:
+                    related[mid] = {"id": mid, "content": mem.content, "shared_keys": [], "depth": round(mem.depth, 3)}
+                if concept not in related[mid]["shared_keys"]:
+                    related[mid]["shared_keys"].append(concept)
 
         return list(related.values())
 
@@ -416,18 +472,23 @@ class MemoryGraph:
             if memory_id not in self.memories:
                 return False
             del self.memories[memory_id]
-            self.links = [l for l in self.links if l.memory_id != memory_id]
-            used_kids = {l.key_id for l in self.links}
-            self.keys = {kid: k for kid, k in self.keys.items() if kid in used_kids}
+            self._unlink_memory(memory_id)
+            # 고아 키 정리
+            for kid in [k for k in list(self.keys) if k not in self._key_to_mems]:
+                del self.keys[kid]
+            # supersede 인덱스 정리
+            self._superseded_by.pop(memory_id, None)
+            for old_id, new_id in list(self._superseded_by.items()):
+                if new_id == memory_id:
+                    del self._superseded_by[old_id]
             await self.save()
             return True
 
     # ── 전체 조회 ──
 
     def list_all(self) -> list[dict]:
-        results = []
-        for mid, mem in self.memories.items():
-            results.append({
+        return [
+            {
                 "id": mid,
                 "content": mem.content,
                 "keys": self.get_keys_for_memory(mid),
@@ -435,8 +496,9 @@ class MemoryGraph:
                 "access_count": mem.access_count,
                 "supersedes": mem.supersedes,
                 "created_at": mem.created_at,
-            })
-        return results
+            }
+            for mid, mem in self.memories.items()
+        ]
 
 
 # ── 대화 원본 ──

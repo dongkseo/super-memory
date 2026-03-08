@@ -416,6 +416,11 @@ class MemoryGraph:
                         if other_mid not in mem_hop:
                             mem_hop[other_mid] = 2
 
+            # superseded 메모리(구버전)는 score에 패널티 적용
+            for mid in list(mem_scores.keys()):
+                if mid in self._superseded_by:
+                    mem_scores[mid] *= 0.1
+
             ranked = sorted(mem_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
             results = []

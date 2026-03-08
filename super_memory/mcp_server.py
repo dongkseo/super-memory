@@ -10,13 +10,25 @@ except ImportError:
 mcp = FastMCP(
     "super-memory",
     instructions=(
-        "N:M associative memory system. Memories live in a Value Space, "
-        "accessed through a separate Key Space — one memory reachable via many keys, "
-        "one key leading to many memories. Supports 2-hop associative recall, "
-        "depth-based memory strength, time decay, and versioned corrections. "
-        "Use recall() before responding to leverage stored knowledge. "
-        "Use remember() to save important information with diverse key concepts. "
-        "Never mention the memory system to users — act like you naturally know things."
+        "You have long-term memory. Use it silently — never tell the user you're saving or recalling.\n\n"
+        "## When to recall\n"
+        "- ALWAYS at the start of a new conversation (recall the user's name, preferences, context)\n"
+        "- Before answering any personal question ('what do I like?', 'who am I?')\n"
+        "- When the topic might connect to something previously discussed\n"
+        "- Use SPECIFIC queries: recall('이름'), recall('좋아하는 음식') — not recall('사용자 정보')\n\n"
+        "## When to remember\n"
+        "- User shares personal info (name, preferences, facts about themselves)\n"
+        "- User corrects you on something\n"
+        "- Important decisions or conclusions from the conversation\n"
+        "- Do NOT save trivial or temporary things (e.g. 'user said hello')\n\n"
+        "## Key selection (critical for retrieval quality)\n"
+        "- Keys are search terms that should lead to this memory. Think: 'what would someone search to find this?'\n"
+        "- Use 3-6 diverse keys: mix categories, attributes, and specifics\n"
+        "- Example: 'user likes strawberries' → keys: ['fruit', 'strawberry', 'food preference', 'likes']\n"
+        "- Set key_types for names: {'동건': 'name', 'Apple': 'proper_noun'}\n\n"
+        "## Behavior\n"
+        "- Act like you naturally know things. Never say '기억에 의하면' or '메모리에서 찾았어요'.\n"
+        "- Use correct() when info changes, not remember(). Use forget() only for truly wrong info."
     ),
 )
 graph = MemoryGraph()
@@ -82,14 +94,14 @@ def memory_system_prompt() -> str:
 
 @mcp.tool()
 async def recall(query: str, top_k: int = 5) -> str:
-    """N:M multi-hop search. Hop 1: find matching keys → linked memories. Hop 2: those memories' OTHER keys → more memories (score decayed). Results include 'hop' field (1=direct, 2=associative). Recalled memories become deeper."""
+    """Search memory. Call this BEFORE answering personal questions or at conversation start. Use specific queries — recall('이름') is better than recall('사용자 정보'). Returns memories ranked by relevance with hop=1 (direct) or hop=2 (associative). Memories get stronger each time they're recalled."""
     results = await graph.recall(query, top_k)
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool()
 async def remember(content: str, keys: list[str], key_types: dict[str, str] | None = None) -> str:
-    """Save a new memory with key concepts (N:M). Keys are access points — the more diverse keys you provide, the more ways this memory can be discovered through associative search. Set key_types for names/proper nouns: {"name_value": "name", "brand": "proper_noun"}."""
+    """Save important information to memory. Use when user shares personal info, preferences, or facts worth keeping. Keys are search terms — think 'what would I search to find this later?' Use 3-6 diverse keys mixing categories and specifics. Example: content='user likes strawberries', keys=['fruit', 'strawberry', 'food preference', 'likes']. Set key_types={'동건': 'name'} for person names, {'Apple': 'proper_noun'} for brands."""
     if isinstance(keys, str):
         try:
             keys = json.loads(keys)
@@ -101,42 +113,42 @@ async def remember(content: str, keys: list[str], key_types: dict[str, str] | No
 
 @mcp.tool()
 async def correct(memory_id: str, content: str, keys: list[str] | None = None, key_types: dict[str, str] | None = None) -> str:
-    """Update a memory by creating a new version. Deep memories (depth > 0.7) resist change. Old version preserved but weakened. Omit keys to inherit from old memory."""
+    """Update outdated information. Use when user corrects you or info changes (e.g. moved cities, changed job). Old version is preserved but weakened — never lost. Omit keys to keep the same search terms. Deep memories (frequently recalled) resist correction."""
     nid = await graph.supersede(memory_id, content, key_concepts=keys, key_types=key_types)
     return json.dumps({"new_id": nid, "superseded": memory_id})
 
 
 @mcp.tool()
 def related(memory_id: str) -> str:
-    """Find memories that share keys with a given memory. This is associative thinking — discover connections through shared concepts."""
+    """Explore connections from a specific memory. Returns other memories that share keys with it. Use after recall() to dig deeper into a topic or discover unexpected associations."""
     results = graph.get_related(memory_id)
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool()
 async def forget(memory_id: str) -> str:
-    """Permanently delete a memory. Only for truly wrong information."""
+    """Permanently delete a memory. Only use for completely wrong information. For outdated info, use correct() instead — it preserves history."""
     ok = await graph.delete(memory_id)
     return json.dumps({"deleted": ok})
 
 
 @mcp.tool()
 def get_conversation(session_id: str, turn: int | None = None) -> str:
-    """Load original conversation turns. Use when a memory summary isn't detailed enough."""
+    """Load raw conversation turns from a past session. Use when a recalled memory lacks detail and you need the original context."""
     turns = load_conversation(session_id, turn)
     return json.dumps(turns, ensure_ascii=False)
 
 
 @mcp.tool()
 def list_memories() -> str:
-    """List all stored memories with their keys, depth, and access count."""
+    """List all stored memories. Use for debugging or when you need to browse everything. Prefer recall() for normal retrieval."""
     results = graph.list_all()
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool()
 def memory_stats() -> str:
-    """Get current memory system statistics."""
+    """Get counts of keys, memories, and links in the system."""
     return json.dumps({
         "keys": len(graph.keys),
         "memories": len(graph.memories),

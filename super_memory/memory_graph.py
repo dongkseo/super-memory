@@ -36,14 +36,24 @@ def embed_text(text: str) -> list[float]:
     return resp.json()["data"][0]["embedding"]
 
 
+_async_client: httpx.AsyncClient | None = None
+
+
+def _get_async_client() -> httpx.AsyncClient:
+    global _async_client
+    if _async_client is None or _async_client.is_closed:
+        _async_client = httpx.AsyncClient(timeout=30)
+    return _async_client
+
+
 async def embed_text_async(text: str) -> list[float]:
     """OpenAI Embedding API 호출 (비동기)."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
-        )
+    client = _get_async_client()
+    resp = await client.post(
+        "https://api.openai.com/v1/embeddings",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json={"model": OPENAI_EMBEDDING_MODEL, "input": text},
+    )
     resp.raise_for_status()
     return resp.json()["data"][0]["embedding"]
 
@@ -112,25 +122,26 @@ class MemoryGraph:
             self.links.append(Link(**lnk))
         print(f"[graph] loaded {len(self.keys)} keys, {len(self.memories)} memories, {len(self.links)} links")
 
-    def save(self) -> None:
-        """즉시 디스크에 저장하고 dirty 플래그 해제."""
+    async def save(self) -> None:
+        """비동기로 디스크에 저장하고 dirty 플래그 해제."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         data = {
             "keys": {kid: _key_dict(k) for kid, k in self.keys.items()},
             "memories": {mid: _mem_dict(m) for mid, m in self.memories.items()},
             "links": [{"key_id": l.key_id, "memory_id": l.memory_id} for l in self.links],
         }
-        GRAPH_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(GRAPH_FILE.write_text, content)
         self._dirty = False
 
     def mark_dirty(self) -> None:
         """변경이 있음을 표시. flush()로 나중에 저장."""
         self._dirty = True
 
-    def flush(self) -> None:
+    async def flush(self) -> None:
         """dirty 상태일 때만 저장."""
         if self._dirty:
-            self.save()
+            await self.save()
 
     # ── Key 관리 ──
 
@@ -204,7 +215,7 @@ class MemoryGraph:
                 kid = await self.find_or_create_key(concept, key_type=kt)
                 if not any(l.key_id == kid and l.memory_id == mid for l in self.links):
                     self.links.append(Link(key_id=kid, memory_id=mid))
-            self.save()
+            await self.save()
             return mid
 
     # ── 기억 수정 (supersede) ──
@@ -248,7 +259,7 @@ class MemoryGraph:
                     if l.memory_id == old_id:
                         self.links.append(Link(key_id=l.key_id, memory_id=mid))
 
-            self.save()
+            await self.save()
             return mid
 
     # ── N:M 검색 (멀티홉 + IDF) ──
@@ -367,7 +378,7 @@ class MemoryGraph:
                 })
 
             self.mark_dirty()
-            self.flush()
+            await self.flush()
             return results
 
     # ── 연관 기억 탐색 (공유 키 기반) ──
@@ -408,7 +419,7 @@ class MemoryGraph:
             self.links = [l for l in self.links if l.memory_id != memory_id]
             used_kids = {l.key_id for l in self.links}
             self.keys = {kid: k for kid, k in self.keys.items() if kid in used_kids}
-            self.save()
+            await self.save()
             return True
 
     # ── 전체 조회 ──

@@ -1,6 +1,6 @@
 [project]
 name = "mcp-super-memory"
-version = "0.2.1"
+version = "0.3.0"
 description = "N:M Associative Memory System for LLM Agents"
 readme = "README.md"
 license = "MIT"

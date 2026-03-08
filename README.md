@@ -216,7 +216,7 @@ claude mcp add mcp-super-memory -e EMBEDDING_BACKEND=local -- uvx "mcp-super-mem
 ### Manual / Development
 
 ```bash
-git clone https://github.com/donggyun112/super-memory
+git clone https://github.com/donggyun112/mcp-super-memory
 cd super-memory
 ```
 

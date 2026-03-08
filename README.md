@@ -140,9 +140,9 @@ Scores from both paths are summed. This ensures memories are found even when the
 
 ---
 
-## Agent Tools
+## MCP Tools
 
-The memory system exposes 6 tools to LLM agents:
+The memory system exposes 8 tools via MCP:
 
 | Tool | Description |
 |------|-------------|
@@ -152,12 +152,39 @@ The memory system exposes 6 tools to LLM agents:
 | `related(memory_id)` | Find memories sharing keys (associative exploration) |
 | `forget(memory_id)` | Permanently delete |
 | `get_conversation(session_id, turn?)` | Load original conversation turns |
+| `list_memories()` | List all stored memories with keys, depth, access count |
+| `memory_stats()` | Get current key/memory/link counts |
 
-The agent is instructed to `recall` before every response, use diverse keys on `remember`, and treat `related` as associative thinking. The memory system is invisible to the user — the agent never mentions saving or recalling.
+A system prompt template is also available via `memory_system_prompt` MCP prompt — include it to instruct the agent to recall silently, use diverse keys, and never mention the memory system to users.
 
 ---
 
-## Quick Start
+## Quick Start (MCP Server)
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "super-memory": {
+      "command": "uvx",
+      "args": ["super-memory"],
+      "env": {
+        "OPENAI_API_KEY": "your-openai-api-key"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+```bash
+claude mcp add super-memory -- uvx super-memory
+```
+
+### Manual / Development
 
 ```bash
 git clone https://github.com/donggyun112/super-memory
@@ -170,18 +197,14 @@ OPENAI_API_KEY=your-openai-api-key
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-Run:
 ```bash
 uv sync
-python main.py
+uv run super-memory
 ```
-
-Open `http://localhost:3000` — login with your Anthropic account via OAuth.
 
 **Requirements:**
 - Python 3.12+
 - OpenAI API key (for embeddings)
-- Anthropic API access (OAuth or API key, for chat)
 
 ---
 

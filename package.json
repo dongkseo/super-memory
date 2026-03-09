@@ -4,8 +4,17 @@
   "type": "module",
   "description": "N:M Associative Memory System for LLM Agents",
   "main": "dist/index.js",
+  "bin": {
+    "mcp-super-memory": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },

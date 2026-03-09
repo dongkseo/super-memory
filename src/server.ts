@@ -23,6 +23,12 @@ function parseObject(v: unknown): Record<string, unknown> | null {
   return null;
 }
 
+function parseNumber(v: unknown): number | null {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") { const n = Number(v); return isNaN(n) ? null : n; }
+  return null;
+}
+
 const MEMORY_SYSTEM = `\
 You are a helpful assistant. You have long-term memory — use it silently and proactively.
 
@@ -49,9 +55,11 @@ Stats: {stats}
 1. **MUST recall before your first reply.** Silently, in parallel.
 2. Recall again whenever the topic shifts or a personal question comes up.
 3. Never say "I don't know" without recalling first.
-4. Use SPECIFIC queries — multiple targeted recalls beat one broad recall.
-   - ❌ recall("사용자 정보") — too vague
+4. **Query = short noun/keyword, NOT a full sentence.**
+   - ❌ recall("어디 살아"), recall("뭐 마셔") — 구어체 문장은 매칭 안 됨
+   - ✅ recall("거주지"), recall("음료") — 명사 키워드로 검색
    - ✅ recall("이름"), recall("직업"), recall("취향") — specific, multiple
+   - 복합 개념이면 키워드 여러 개로 분리: recall("운동"), recall("취미"), recall("건강")
 5. If \`superseded_by\` exists, always prefer the newer version.
 
 ### Remember (PROACTIVE — capture what matters)
@@ -287,7 +295,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             keyTypes: parseObject(a.key_types) as Record<string, string> | null,
             namespace: typeof a.namespace === "string" ? a.namespace : "default",
-            ttlSeconds: typeof a.ttl_seconds === "number" ? a.ttl_seconds : null,
+            ttlSeconds: parseNumber(a.ttl_seconds),
             relatedTo: parseArray(a.related_to) as string[] | null,
           }
         );
@@ -355,7 +363,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const [mid, wasDedup] = await graph.add(content, keys, {
             keyTypes: item.key_types as Record<string, string> | null,
             namespace: typeof item.namespace === "string" ? item.namespace : "default",
-            ttlSeconds: typeof item.ttl_seconds === "number" ? item.ttl_seconds : null,
+            ttlSeconds: parseNumber(item.ttl_seconds),
             relatedTo: Array.isArray(item.related_to) ? (item.related_to as string[]) : null,
           });
           results.push({ saved: mid, deduplicated: wasDedup });

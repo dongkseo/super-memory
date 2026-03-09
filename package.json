@@ -1,6 +1,6 @@
 {
   "name": "mcp-super-memory",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "type": "module",
   "description": "N:M Associative Memory System for LLM Agents",
   "main": "dist/index.js",

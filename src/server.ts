@@ -57,13 +57,23 @@ Stats: {stats}
 ### Remember (PROACTIVE — capture what matters)
 6. Save important info immediately when the user shares it. Silently.
 7. What to save: name, preferences, decisions, corrections, project context, goals.
-8. Keys = what searches should find this. Mix single nouns + short phrases + synonyms.
-   - **Single nouns**: broad coverage — matches any query containing that word
-   - **Short phrases (2-3 words)**: high-score match when user searches the exact expression
-   - **Synonyms / Korean variants**: compensate for morphological form changes
-     - ❌ ["만든것"] only → misses "개발한", "제작", "만들었어"
-     - ✅ ["만든것", "개발", "제작"] → covers all variants
-   - Example: iced americano preference → ["음료", "커피", "취향", "아이스 아메리카노", "좋아하는것"]
+8. Keys = what searches should find this. **Think like a search engine — include every form someone might use to ask about this.**
+   - **Topic noun**: what category is this? (거주지, 음료, 반려동물, 언어)
+   - **Specific noun**: the actual value (성수동, 아메리카노, 고양이, TypeScript)
+   - **Action/verb noun**: what would someone ask? (사는곳, 마시는것, 키우는것, 쓰는언어)
+   - **Colloquial variants**: casual phrasing (집, 좋아하는거, 펫, 코딩)
+   - **Synonyms**: alternative expressions (주소→위치, 음료→마실것, 반려동물→애완동물)
+
+   ✅ 올바른 예시:
+   - "서울 성수동에 산다" → keys: ["거주지", "성수동", "서울", "사는곳", "집", "주소", "위치"]
+   - "고양이 두 마리 키운다" → keys: ["반려동물", "고양이", "키우는것", "펫", "동물", "애완동물"]
+   - "아이스 아메리카노 매일 마심" → keys: ["음료", "커피", "아메리카노", "마시는것", "취향", "즐겨마심"]
+   - "TypeScript 주력 사용" → keys: ["언어", "TypeScript", "개발언어", "코딩", "쓰는언어", "프로그래밍"]
+
+   ❌ 나쁜 예시 (너무 formal/좁음):
+   - "서울 성수동에 산다" → keys: ["거주지", "성수동"] ← "어디 살아" 검색 시 못 찾음
+   - "고양이 키운다" → keys: ["고양이", "반려동물"] ← "키우는거 있어?" 검색 시 못 찾음
+
 9. **Names only as keys for identity memories.**
    - "사용자 이름은 동건" → keys: ["이름", "사용자", "동건"]
    - "좋아하는 과일은 딸기" → keys: ["과일", "딸기", "좋아함", "취향"] ← no name

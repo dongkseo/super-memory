@@ -7,6 +7,22 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { MemoryGraph, loadConversation, sanitizeKeys } from "./memoryGraph.js";
 
+function parseArray(v: unknown): unknown[] | null {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p : null; } catch { return null; }
+  }
+  return null;
+}
+
+function parseObject(v: unknown): Record<string, unknown> | null {
+  if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+  if (typeof v === "string") {
+    try { const p = JSON.parse(v); return p && typeof p === "object" ? p : null; } catch { return null; }
+  }
+  return null;
+}
+
 const MEMORY_SYSTEM = `\
 You are a helpful assistant. You have long-term memory — use it silently and proactively.
 
@@ -259,10 +275,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           a.content as string,
           keys,
           {
-            keyTypes: a.key_types as Record<string, string> | null,
+            keyTypes: parseObject(a.key_types) as Record<string, string> | null,
             namespace: typeof a.namespace === "string" ? a.namespace : "default",
             ttlSeconds: typeof a.ttl_seconds === "number" ? a.ttl_seconds : null,
-            relatedTo: Array.isArray(a.related_to) ? (a.related_to as string[]) : null,
+            relatedTo: parseArray(a.related_to) as string[] | null,
           }
         );
         const result = wasDedup
@@ -276,9 +292,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           a.memory_id as string,
           a.content as string,
           {
-            keyConcepts: Array.isArray(a.keys) ? (a.keys as string[]) : null,
-            keyTypes: a.key_types as Record<string, string> | null,
-            relatedTo: Array.isArray(a.related_to) ? (a.related_to as string[]) : null,
+            keyConcepts: parseArray(a.keys) as string[] | null,
+            keyTypes: parseObject(a.key_types) as Record<string, string> | null,
+            relatedTo: parseArray(a.related_to) as string[] | null,
           }
         );
         return {
@@ -317,7 +333,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "remember_batch": {
-        const items = a.items as Array<Record<string, unknown>>;
+        const items = (parseArray(a.items) ?? []) as Array<Record<string, unknown>>;
         const results: object[] = [];
         for (const item of items) {
           const content = item.content as string;

@@ -545,7 +545,7 @@ class MemoryGraph:
                 if key.key_type in ("name", "proper_noun"):
                     if key.concept.lower() in query_lower:
                         key_scores.append((1.0, kid))
-                elif float(key_sims[i]) >= 0.3:
+                elif float(key_sims[i]) >= 0.35:
                     key_scores.append((float(key_sims[i]), kid))
             key_scores.sort(reverse=True)
 
@@ -618,6 +618,10 @@ class MemoryGraph:
                     if linked_id not in mem_hop:
                         mem_hop[linked_id] = 2
 
+            if expand:
+                for mid in mem_scores:
+                    if mem_hop.get(mid, 1) == 2:
+                        mem_scores[mid] *= 0.7
             actual_top_k = top_k * 2 if expand else top_k
             ranked = sorted(mem_scores.items(), key=lambda x: x[1], reverse=True)[:actual_top_k]
 
@@ -665,7 +669,7 @@ class MemoryGraph:
             for mid in self._key_to_mems.get(kid, set()):
                 if mid == memory_id or mid not in self.memories:
                     continue
-                if self._is_expired(self.memories[mid]):
+                if self._is_expired(self.memories[mid]) or mid in self._superseded_by:
                     continue
                 mem = self.memories[mid]
                 if mid not in related:
@@ -743,6 +747,7 @@ class MemoryGraph:
             }
             for mid, mem in self.memories.items()
             if not self._is_expired(mem)
+            and mid not in self._superseded_by
             and (namespace is None or mem.namespace == namespace)
         ]
 

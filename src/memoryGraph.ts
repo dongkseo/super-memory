@@ -14,6 +14,8 @@ const CONVERSATIONS_DIR = join(DATA_DIR, "conversations");
 const KEY_MERGE_THRESHOLD = 0.85;
 const MEMORY_DEDUP_THRESHOLD = 0.9;
 const KEY_AUTO_LINK_THRESHOLD = 0.5;
+const KEY_RECALL_THRESHOLD = 0.28;
+const CONTENT_RECALL_THRESHOLD = 0.28;
 const DEPTH_INCREMENT = 0.05;
 const DEPTH_MAX = 1.0;
 const DEPTH_DEEP_THRESHOLD = 0.7;
@@ -75,7 +77,7 @@ export class MemoryGraph {
   private _lock = new Mutex();
   private _dirty = false;
 
-  static readonly HOP_DECAY = 0.3;
+  static readonly HOP_DECAY = 0.5;
   static readonly TIME_HALF_LIFE = 30 * 24 * 3600;
 
   get linkCount(): number {
@@ -524,7 +526,7 @@ export class MemoryGraph {
           if (queryLower.includes(key.concept.toLowerCase())) {
             keyScores.push([1.0, kid]);
           }
-        } else if (keySims[i] >= 0.35) {
+        } else if (keySims[i] >= KEY_RECALL_THRESHOLD) {
           keyScores.push([keySims[i], kid]);
         }
       }
@@ -556,7 +558,7 @@ export class MemoryGraph {
           const mid = memIds[i];
           if (skip(mid)) continue;
           const cSim = contentSims[i];
-          if (cSim >= 0.35) {
+          if (cSim >= CONTENT_RECALL_THRESHOLD) {
             const mem = this.memories[mid];
             const depthFactor = 0.9 + mem.depth * 0.1;
             const tf = this._timeFactor(mem);

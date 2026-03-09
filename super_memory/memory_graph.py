@@ -28,6 +28,8 @@ _DEFAULT_BACKEND = "openai" if OPENAI_API_KEY else "local"
 EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", _DEFAULT_BACKEND)
 
 KEY_MERGE_THRESHOLD = 0.85
+MEMORY_DEDUP_THRESHOLD = 0.9  # 메모리 중복 감지 임계값
+KEY_AUTO_LINK_THRESHOLD = 0.5  # 키 자동 보강 임계값
 DEPTH_INCREMENT = 0.05
 DEPTH_MAX = 1.0
 DEPTH_DEEP_THRESHOLD = 0.7
@@ -168,6 +170,9 @@ class Memory:
     depth: float = 0.0
     access_count: int = 0
     last_accessed: float = 0.0
+    namespace: str = "default"
+    ttl: float | None = None        # Unix timestamp: expires_at (None = permanent)
+    links: list[str] = field(default_factory=list)  # explicit memory links
 
 
 # ── Graph ──
@@ -314,17 +319,90 @@ class MemoryGraph:
             idf *= 0.5
         return idf
 
+    # ── 중복 감지 ──
+
+    def _find_duplicate(self, embedding: list[float]) -> str | None:
+        """기존 메모리 중 의미적으로 거의 동일한 것이 있으면 ID 반환."""
+        if not self.memories:
+            return None
+        # superseded된 메모리는 제외 (최신 버전만 비교)
+        active_mems = [
+            (mid, mem) for mid, mem in self.memories.items()
+            if mid not in self._superseded_by
+        ]
+        if not active_mems:
+            return None
+        ids = [mid for mid, _ in active_mems]
+        matrix = np.array([mem.embedding for _, mem in active_mems])
+        sims = _batch_cosine_sim(embedding, matrix)
+        best_idx = int(np.argmax(sims))
+        if float(sims[best_idx]) >= MEMORY_DEDUP_THRESHOLD:
+            return ids[best_idx]
+        return None
+
+    # ── 키 자동 보강 ──
+
+    def _auto_link_keys(self, memory_id: str, embedding: list[float]) -> None:
+        """content embedding과 유사도가 높은 기존 키에 자동 링크."""
+        if not self.keys:
+            return
+        existing_key_ids = list(self.keys.keys())
+        key_matrix = np.array([self.keys[kid].embedding for kid in existing_key_ids])
+        sims = _batch_cosine_sim(embedding, key_matrix)
+        for i, kid in enumerate(existing_key_ids):
+            if float(sims[i]) >= KEY_AUTO_LINK_THRESHOLD and not self._has_link(kid, memory_id):
+                self._link(kid, memory_id)
+
+    # ── TTL ──
+
+    def _is_expired(self, mem: "Memory") -> bool:
+        return mem.ttl is not None and time.time() > mem.ttl
+
+    async def cleanup_expired(self) -> int:
+        """만료된 메모리 삭제. 삭제된 수 반환."""
+        async with self._lock:
+            expired = [mid for mid, mem in self.memories.items() if self._is_expired(mem)]
+            for mid in expired:
+                del self.memories[mid]
+                self._unlink_memory(mid)
+                self._superseded_by.pop(mid, None)
+                for old_id, new_id in list(self._superseded_by.items()):
+                    if new_id == mid:
+                        del self._superseded_by[old_id]
+            for kid in [k for k in list(self.keys) if k not in self._key_to_mems]:
+                del self.keys[kid]
+            if expired:
+                await self.save()
+            return len(expired)
+
     # ── 기억 추가 ──
 
     async def add(self, content: str, key_concepts: list[str],
             key_types: dict[str, str] | None = None,
-            source: dict | None = None) -> str:
-        """key_types: {"동건": "name", "파이썬": "concept"} 형태로 타입 지정."""
+            source: dict | None = None,
+            namespace: str = "default",
+            ttl_seconds: float | None = None,
+            related_to: list[str] | None = None) -> tuple[str, bool]:
+        """key_types: {"동건": "name", "파이썬": "concept"} 형태로 타입 지정.
+        Returns: (memory_id, was_deduplicated)"""
         embedding = await embed_text_async(content)  # lock 밖에서 API 호출
+        dup_id = None
         async with self._lock:
             self._check_dim(embedding)
             key_types = key_types or {}
+
+            # A) 중복 감지: 기존 메모리와 거의 동일하면 자동 supersede
+            dup_id = self._find_duplicate(embedding)
+
+        if dup_id is not None:
+            new_id = await self.supersede(dup_id, content, key_concepts=key_concepts, key_types=key_types,
+                                          source=source, namespace=namespace, related_to=related_to)
+            return new_id, True
+
+        async with self._lock:
             mid = _uid()
+            expires_at = time.time() + ttl_seconds if ttl_seconds is not None else None
+            valid_links = [lid for lid in (related_to or []) if lid in self.memories]
             self.memories[mid] = Memory(
                 id=mid,
                 content=content,
@@ -332,6 +410,9 @@ class MemoryGraph:
                 created_at=time.time(),
                 source=source,
                 last_accessed=time.time(),
+                namespace=namespace,
+                ttl=expires_at,
+                links=valid_links,
             )
             key_concepts = _sanitize_keys(key_concepts)
             for concept in key_concepts:
@@ -339,8 +420,12 @@ class MemoryGraph:
                 kid = await self.find_or_create_key(concept, key_type=kt)
                 if not self._has_link(kid, mid):
                     self._link(kid, mid)
+
+            # C) 키 자동 보강
+            self._auto_link_keys(mid, embedding)
+
             await self.save()
-            return mid
+            return mid, False
 
     # ── 기억 수정 (supersede) ──
 
@@ -349,16 +434,30 @@ class MemoryGraph:
         key_concepts: list[str] | None = None,
         key_types: dict[str, str] | None = None,
         source: dict | None = None,
+        namespace: str | None = None,
+        related_to: list[str] | None = None,
     ) -> str:
         async with self._lock:
             if old_id not in self.memories:
                 raise ValueError(f"Memory {old_id} not found")
 
             old = self.memories[old_id]
-            old.depth = old.depth * 0.8 if old.depth >= DEPTH_DEEP_THRESHOLD else old.depth * 0.3
+
+            # B) 체인 정리: old가 또 다른 메모리를 supersede하면 grandparent 삭제
+            #    체인 깊이를 최대 1로 유지 (new → old, grandparent는 삭제)
+            grandparent_id = old.supersedes
+            if grandparent_id and grandparent_id in self.memories:
+                del self.memories[grandparent_id]
+                self._unlink_memory(grandparent_id)
+                self._superseded_by.pop(grandparent_id, None)
+                # 고아 키 정리
+                for kid in [k for k in list(self.keys) if k not in self._key_to_mems]:
+                    del self.keys[kid]
 
             key_types = key_types or {}
             mid = _uid()
+            ns = namespace if namespace is not None else old.namespace
+            valid_links = [lid for lid in (related_to or []) if lid in self.memories]
             self.memories[mid] = Memory(
                 id=mid,
                 content=new_content,
@@ -367,7 +466,12 @@ class MemoryGraph:
                 source=source,
                 supersedes=old_id,
                 last_accessed=time.time(),
+                namespace=ns,
+                ttl=old.ttl,
+                links=valid_links,
             )
+            # old의 depth 약화
+            old.depth = old.depth * 0.8 if old.depth >= DEPTH_DEEP_THRESHOLD else old.depth * 0.3
             self._superseded_by[old_id] = mid
 
             if key_concepts:
@@ -380,6 +484,9 @@ class MemoryGraph:
                 # 기존 링크 복사 (스냅샷으로 순회 — 무한루프 방지)
                 for kid in list(self._mem_to_keys.get(old_id, set())):
                     self._link(kid, mid)
+
+            # C) 키 자동 보강
+            self._auto_link_keys(mid, self.memories[mid].embedding)
 
             await self.save()
             return mid
@@ -396,8 +503,11 @@ class MemoryGraph:
         decay = math.exp(-age * decay_rate / self.TIME_HALF_LIFE)
         return 0.5 + 0.5 * decay
 
-    async def recall(self, query: str, top_k: int = 5) -> list[dict]:
-        """두 경로로 검색: (A) 키 매칭 → 링크 → 기억, (B) content 직접 매칭."""
+    async def recall(self, query: str, top_k: int = 5,
+                     namespace: str | None = None,
+                     expand: bool = False) -> list[dict]:
+        """두 경로로 검색: (A) 키 매칭 → 링크 → 기억, (B) content 직접 매칭.
+        namespace: 특정 네임스페이스로 필터링. expand: top_k*2 결과 반환 + 명시적 링크 우선 포함."""
         if not self.memories:
             return []
 
@@ -409,6 +519,16 @@ class MemoryGraph:
             mem_scores: dict[str, float] = {}
             mem_matched_keys: dict[str, list[str]] = {}
             mem_hop: dict[str, int] = {}
+
+            def _skip(mid: str) -> bool:
+                if mid not in self.memories:
+                    return True
+                mem = self.memories[mid]
+                if self._is_expired(mem):
+                    return True
+                if namespace and mem.namespace != namespace:
+                    return True
+                return False
 
             # ── 경로 A: 키 배치 매칭 → 링크 → 기억 ──
             key_ids = list(self.keys.keys())
@@ -430,7 +550,7 @@ class MemoryGraph:
             for key_sim, kid in key_scores[:10]:
                 idf = self._key_idf(kid)
                 for mem_id in self._key_to_mems.get(kid, set()):
-                    if mem_id not in self.memories:
+                    if _skip(mem_id):
                         continue
                     mem = self.memories[mem_id]
                     depth_factor = 0.5 + mem.depth * 0.5
@@ -446,6 +566,8 @@ class MemoryGraph:
                 mem_matrix = np.array([self.memories[mid].embedding for mid in mem_ids])
                 content_sims = _batch_cosine_sim(q_emb, mem_matrix)
                 for i, mid in enumerate(mem_ids):
+                    if _skip(mid):
+                        continue
                     c_sim = float(content_sims[i])
                     if c_sim >= 0.3:
                         mem = self.memories[mid]
@@ -465,7 +587,7 @@ class MemoryGraph:
                     concept = self.keys[kid].concept
                     idf = self._key_idf(kid)
                     for other_mid in self._key_to_mems.get(kid, set()):
-                        if other_mid == mid or other_mid not in self.memories:
+                        if other_mid == mid or _skip(other_mid):
                             continue
                         hop2_score = hop1_score * self.HOP_DECAY * idf
                         mem_scores[other_mid] = mem_scores.get(other_mid, 0) + hop2_score
@@ -473,12 +595,28 @@ class MemoryGraph:
                         if other_mid not in mem_hop:
                             mem_hop[other_mid] = 2
 
+            # ── 명시적 링크 traversal ──
+            for mid in list(mem_scores.keys()):
+                hop1_score = mem_scores[mid]
+                mem_obj = self.memories.get(mid)
+                if not mem_obj:
+                    continue
+                for linked_id in mem_obj.links:
+                    if linked_id == mid or _skip(linked_id):
+                        continue
+                    link_score = hop1_score * self.HOP_DECAY
+                    mem_scores[linked_id] = mem_scores.get(linked_id, 0) + link_score
+                    mem_matched_keys.setdefault(linked_id, []).append("(linked)")
+                    if linked_id not in mem_hop:
+                        mem_hop[linked_id] = 2
+
             # superseded 메모리(구버전)는 score에 패널티 적용
             for mid in list(mem_scores.keys()):
                 if mid in self._superseded_by:
                     mem_scores[mid] *= 0.1
 
-            ranked = sorted(mem_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            actual_top_k = top_k * 2 if expand else top_k
+            ranked = sorted(mem_scores.items(), key=lambda x: x[1], reverse=True)[:actual_top_k]
 
             results = []
             for mid, score in ranked:
@@ -499,6 +637,8 @@ class MemoryGraph:
                     "supersedes": mem.supersedes,
                     "superseded_by": self._superseded_by.get(mid),
                     "created_at": mem.created_at,
+                    "namespace": mem.namespace,
+                    "links": mem.links,
                 })
 
             self.mark_dirty()
@@ -509,21 +649,57 @@ class MemoryGraph:
     # ── 연관 기억 탐색 (공유 키 기반) ──
 
     def get_related(self, memory_id: str) -> list[dict]:
-        """이 기억의 키를 공유하는 다른 기억 찾기 = 연상."""
+        """이 기억의 키를 공유하거나 명시적으로 연결된 다른 기억 찾기.
+        key-sharing + explicit links (양방향) 모두 포함."""
         if memory_id not in self.memories:
             return []
 
         related: dict[str, dict] = {}
+
+        # ── key-sharing 연상 ──
         for kid in self._mem_to_keys.get(memory_id, set()):
             concept = self.keys[kid].concept if kid in self.keys else "?"
             for mid in self._key_to_mems.get(kid, set()):
                 if mid == memory_id or mid not in self.memories:
                     continue
+                if self._is_expired(self.memories[mid]):
+                    continue
                 mem = self.memories[mid]
                 if mid not in related:
-                    related[mid] = {"id": mid, "content": mem.content, "shared_keys": [], "depth": round(mem.depth, 3)}
+                    related[mid] = {"id": mid, "content": mem.content, "shared_keys": [],
+                                    "link_type": "key", "depth": round(mem.depth, 3)}
                 if concept not in related[mid]["shared_keys"]:
                     related[mid]["shared_keys"].append(concept)
+
+        # ── 명시적 링크 (→ 방향) ──
+        source_mem = self.memories[memory_id]
+        for linked_id in source_mem.links:
+            if linked_id not in self.memories or linked_id == memory_id:
+                continue
+            if self._is_expired(self.memories[linked_id]):
+                continue
+            mem = self.memories[linked_id]
+            if linked_id not in related:
+                related[linked_id] = {"id": linked_id, "content": mem.content,
+                                      "shared_keys": ["(explicit →)"],
+                                      "link_type": "explicit", "depth": round(mem.depth, 3)}
+            else:
+                related[linked_id]["link_type"] = "both"
+                if "(explicit →)" not in related[linked_id]["shared_keys"]:
+                    related[linked_id]["shared_keys"].append("(explicit →)")
+
+        # ── 역방향 링크 (← 방향) ──
+        for mid, mem in self.memories.items():
+            if mid == memory_id or self._is_expired(mem):
+                continue
+            if memory_id in mem.links:
+                if mid not in related:
+                    related[mid] = {"id": mid, "content": mem.content,
+                                    "shared_keys": ["(explicit ←)"],
+                                    "link_type": "explicit", "depth": round(mem.depth, 3)}
+                else:
+                    if "(explicit ←)" not in related[mid]["shared_keys"]:
+                        related[mid]["shared_keys"].append("(explicit ←)")
 
         return list(related.values())
 
@@ -548,7 +724,7 @@ class MemoryGraph:
 
     # ── 전체 조회 ──
 
-    def list_all(self) -> list[dict]:
+    def list_all(self, namespace: str | None = None) -> list[dict]:
         return [
             {
                 "id": mid,
@@ -558,8 +734,13 @@ class MemoryGraph:
                 "access_count": mem.access_count,
                 "supersedes": mem.supersedes,
                 "created_at": mem.created_at,
+                "namespace": mem.namespace,
+                "expires_at": mem.ttl,
+                "links": mem.links,
             }
             for mid, mem in self.memories.items()
+            if not self._is_expired(mem)
+            and (namespace is None or mem.namespace == namespace)
         ]
 
 
@@ -624,4 +805,5 @@ def _mem_dict(m: Memory) -> dict:
         "source": m.source, "supersedes": m.supersedes,
         "depth": m.depth, "access_count": m.access_count,
         "last_accessed": m.last_accessed,
+        "namespace": m.namespace, "ttl": m.ttl, "links": m.links,
     }

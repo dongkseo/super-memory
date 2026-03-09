@@ -93,34 +93,41 @@ def memory_system_prompt() -> str:
 
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5) -> str:
-    """Search memory. Call this BEFORE answering personal questions or at conversation start. Use specific queries — recall('이름') is better than recall('사용자 정보'). Returns memories ranked by relevance with hop=1 (direct) or hop=2 (associative). Memories get stronger each time they're recalled."""
-    results = await graph.recall(query, top_k)
+async def recall(query: str, top_k: int = 5, namespace: str | None = None, expand: bool = False) -> str:
+    """Search memory. namespace filters to a specific project/context. expand=True returns up to 2x results by following explicit memory links — use when initial results feel insufficient. Returns memories ranked by relevance with hop=1 (direct) or hop=2 (associative). Memories get stronger each time they're recalled."""
+    results = await graph.recall(query, top_k, namespace=namespace, expand=expand)
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool()
-async def remember(content: str, keys: list[str], key_types: dict[str, str] | None = None) -> str:
-    """Save important information to memory. Use when user shares personal info, preferences, or facts worth keeping. Keys are search terms — think 'what would I search to find this later?' Use 3-6 diverse keys mixing categories and specifics. Example: content='user likes strawberries', keys=['fruit', 'strawberry', 'food preference', 'likes']. Set key_types={'동건': 'name'} for person names, {'Apple': 'proper_noun'} for brands."""
+async def remember(content: str, keys: list[str], key_types: dict[str, str] | None = None,
+                   namespace: str = "default", ttl_seconds: float | None = None,
+                   related_to: list[str] | None = None) -> str:
+    """Save important information to memory. Keys are search terms — think 'what would I search to find this later?' Use 3-6 diverse keys. namespace groups memories by project/context (e.g. 'work', 'personal'). ttl_seconds sets expiry for temporary memories (e.g. 3600 = 1 hour; None = permanent). related_to links this memory to existing memory IDs for explicit graph traversal."""
     if isinstance(keys, str):
         try:
             keys = json.loads(keys)
         except (json.JSONDecodeError, TypeError):
             keys = [keys]
-    mid = await graph.add(content, keys, key_types=key_types)
+    mid, was_dedup = await graph.add(content, keys, key_types=key_types,
+                                     namespace=namespace, ttl_seconds=ttl_seconds, related_to=related_to)
+    if was_dedup:
+        return json.dumps({"saved": mid, "deduplicated": True, "note": "Similar memory existed — updated instead of creating duplicate"})
     return json.dumps({"saved": mid})
 
 
 @mcp.tool()
-async def correct(memory_id: str, content: str, keys: list[str] | None = None, key_types: dict[str, str] | None = None) -> str:
-    """Update outdated information. Use when user corrects you or info changes (e.g. moved cities, changed job). Old version is preserved but weakened — never lost. Omit keys to keep the same search terms. Deep memories (frequently recalled) resist correction."""
-    nid = await graph.supersede(memory_id, content, key_concepts=keys, key_types=key_types)
+async def correct(memory_id: str, content: str, keys: list[str] | None = None,
+                  key_types: dict[str, str] | None = None,
+                  related_to: list[str] | None = None) -> str:
+    """Update outdated information. Use when user corrects you or info changes (e.g. moved cities, changed job). Old version is preserved but weakened — never lost. Omit keys to keep the same search terms. related_to links the updated memory to other memory IDs."""
+    nid = await graph.supersede(memory_id, content, key_concepts=keys, key_types=key_types, related_to=related_to)
     return json.dumps({"new_id": nid, "superseded": memory_id})
 
 
 @mcp.tool()
 def related(memory_id: str) -> str:
-    """Explore connections from a specific memory. Returns other memories that share keys with it. Use after recall() to dig deeper into a topic or discover unexpected associations."""
+    """Explore connections from a specific memory. Returns memories connected by shared keys OR explicit links (both directions). Use after recall() to drill down: recall → pick ID → related → pick ID → related → ..."""
     results = graph.get_related(memory_id)
     return json.dumps(results, ensure_ascii=False)
 
@@ -140,10 +147,43 @@ def get_conversation(session_id: str, turn: int | None = None) -> str:
 
 
 @mcp.tool()
-def list_memories() -> str:
-    """List all stored memories. Use for debugging or when you need to browse everything. Prefer recall() for normal retrieval."""
-    results = graph.list_all()
+def list_memories(namespace: str | None = None) -> str:
+    """List all stored memories. namespace filters by project/context. Expired memories are excluded. Prefer recall() for normal retrieval."""
+    results = graph.list_all(namespace=namespace)
     return json.dumps(results, ensure_ascii=False)
+
+
+@mcp.tool()
+async def remember_batch(items: list[dict]) -> str:
+    """Save multiple memories in one call. Each item: {content, keys, key_types?, namespace?, ttl_seconds?, related_to?}. Returns list of saved IDs. More efficient than multiple remember() calls."""
+    results = []
+    for item in items:
+        content = item.get("content", "")
+        keys = item.get("keys", [])
+        if not content or not keys:
+            results.append({"error": "content and keys required", "item": item})
+            continue
+        if isinstance(keys, str):
+            try:
+                keys = json.loads(keys)
+            except (json.JSONDecodeError, TypeError):
+                keys = [keys]
+        mid, was_dedup = await graph.add(
+            content, keys,
+            key_types=item.get("key_types"),
+            namespace=item.get("namespace", "default"),
+            ttl_seconds=item.get("ttl_seconds"),
+            related_to=item.get("related_to"),
+        )
+        results.append({"saved": mid, "deduplicated": was_dedup})
+    return json.dumps(results, ensure_ascii=False)
+
+
+@mcp.tool()
+async def cleanup_expired() -> str:
+    """Delete all memories past their ttl. Returns count of deleted memories. Call periodically to keep memory clean."""
+    count = await graph.cleanup_expired()
+    return json.dumps({"deleted": count})
 
 
 @mcp.tool()

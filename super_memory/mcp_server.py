@@ -213,6 +213,6 @@ def memory_stats() -> str:
     """Get counts of keys, memories, and links in the system."""
     return json.dumps({
         "keys": len(graph.keys),
-        "memories": len(graph.memories),
+        "memories": len(graph.list_all()),
         "links": graph.link_count,
     })
